@@ -1,3 +1,4 @@
 This script was written by Claude.
 
-Usage: 
+Usage:  photoframe-upload.sh <image> <ip address>
+

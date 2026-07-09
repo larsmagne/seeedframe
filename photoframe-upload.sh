@@ -28,7 +28,7 @@ if [ $# -lt 2 ]; then
   echo "Usage: $0 <image-file> <device-ip> [width] [height]"
   echo "  e.g.: $0 photo.jpg 192.168.1.220 1200 1600"
   echo "  Tune saturation with an env var, e.g.: SATURATION=200 $0 photo.jpg 192.168.1.220"
-  echo "  Tune/disable letterbox trim, e.g.: TRIM_FUZZ=5 $0 ...   or   TRIM=0 $0 ..."
+  echo "  Tune/disable contrast stretch: CONTRAST_STRETCH=2% $0 ...   or   NORMALIZE=0 $0 ..."
   exit 1
 fi
 
@@ -45,17 +45,14 @@ fi
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
-# Trim burned-in black letterbox/pillarbox bars before anything else, so they
-# don't get counted as "content" by the aspect-ratio crop below. Uses the
-# corner pixel color as the reference and strips any matching uniform border.
-# CAVEAT: this can't tell burned-in black bars apart from a genuinely dark/
-# black image edge (e.g. a night scene) — it just trims whatever uniform
-# color band it finds. Real encoder-burned bars are near-perfectly flat black,
-# so a low fuzz tolerance (default 3%) should catch them while mostly leaving
-# real dark photo edges alone, but set TRIM=0 to disable this step entirely
-# if it ever clips something it shouldn't.
-TRIM="${TRIM:-1}"
-TRIM_FUZZ="${TRIM_FUZZ:-3}"
+# How much to clip at each end before stretching to full black/white range.
+# 1% means the darkest/brightest 1% of pixels are allowed to clip, and
+# everything else gets linearly stretched across the full 0-255 range. This
+# fixes washed-out/low-contrast source images. Set to 0% for a literal
+# min/max stretch (riskier — one stray bright/dark pixel can ruin it), or
+# NORMALIZE=0 to disable this step entirely.
+NORMALIZE="${NORMALIZE:-1}"
+CONTRAST_STRETCH="${CONTRAST_STRETCH:-1%}"
 
 # How much to boost saturation before dithering. 100 = unchanged, 150 = +50%.
 # E-paper panels render noticeably less vivid than their pure RGB values, so
@@ -69,22 +66,22 @@ SATURATION="${SATURATION:-160}"
 PERCEIVED=(  "rgb(2,2,2)"     "rgb(190,200,200)" "rgb(205,202,0)" "rgb(135,19,0)" "rgb(5,64,158)"  "rgb(39,102,60)" )
 THEORETICAL=("rgb(0,0,0)"     "rgb(255,255,255)" "rgb(255,255,0)" "rgb(255,0,0)"  "rgb(0,0,255)"   "rgb(0,255,0)"   )
 
-if [ "$TRIM" = "1" ]; then
-  echo "1/6  Trimming burned-in black letterbox/pillarbox bars (fuzz ${TRIM_FUZZ}%)..."
-  convert "$INPUT" -auto-orient -fuzz "${TRIM_FUZZ}%" -trim +repage "$WORKDIR/trimmed.png"
-else
-  echo "1/6  Skipping letterbox trim (TRIM=0)..."
-  convert "$INPUT" -auto-orient "$WORKDIR/trimmed.png"
-fi
-
-echo "2/6  Cropping/resizing to ${WIDTH}x${HEIGHT} (cover mode)..."
-convert "$WORKDIR/trimmed.png" \
+echo "1/6  Cropping/resizing to ${WIDTH}x${HEIGHT} (cover mode)..."
+convert "$INPUT" -auto-orient \
   -resize "${WIDTH}x${HEIGHT}^" \
   -gravity center -extent "${WIDTH}x${HEIGHT}" \
   "$WORKDIR/cover.png"
 
+if [ "$NORMALIZE" = "1" ]; then
+  echo "2/6  Normalizing light levels (contrast-stretch ${CONTRAST_STRETCH})..."
+  convert "$WORKDIR/cover.png" -contrast-stretch "${CONTRAST_STRETCH}" "$WORKDIR/normalized.png"
+else
+  echo "2/6  Skipping light-level normalization (NORMALIZE=0)..."
+  cp "$WORKDIR/cover.png" "$WORKDIR/normalized.png"
+fi
+
 echo "3/6  Boosting saturation (${SATURATION}%)..."
-convert "$WORKDIR/cover.png" -modulate 100,"${SATURATION}",100 "$WORKDIR/saturated.png"
+convert "$WORKDIR/normalized.png" -modulate 100,"${SATURATION}",100 "$WORKDIR/saturated.png"
 
 echo "4/6  Building device palette swatch..."
 convert "${PERCEIVED[@]/#/xc:}" +append "$WORKDIR/palette.png"
@@ -106,12 +103,18 @@ convert "$WORKDIR/dithered.png" -fuzz 0% "${ARGS[@]}" -type Palette "$WORKDIR/ou
 
 echo "Uploading to http://${DEVICE_IP}/api/display-image ..."
 HTTP_CODE=$(curl -s -o "$WORKDIR/response.json" -w "%{http_code}" \
+  --connect-timeout 5 --max-time 30 \
   -X POST -H "Content-Type: image/png" \
   --data-binary "@$WORKDIR/output.png" \
-  "http://${DEVICE_IP}/api/display-image")
+  "http://${DEVICE_IP}/api/display-image") || true
+
+if [ -z "$HTTP_CODE" ] || [ "$HTTP_CODE" = "000" ]; then
+  echo "ERROR: could not reach ${DEVICE_IP} at all — is it awake, on WiFi, and at that IP?"
+  exit 1
+fi
 
 echo "HTTP status: ${HTTP_CODE}"
-echo "Response: $(cat "$WORKDIR/response.json")"
+echo "Response: $(cat "$WORKDIR/response.json" 2>/dev/null)"
 
 if [ "$HTTP_CODE" != "200" ]; then
   echo "Upload failed."

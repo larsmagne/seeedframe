@@ -30,6 +30,7 @@ usage() {
   echo "  e.g.: $0 photo.jpg 192.168.1.220 1200 1600"
   echo "  e.g.: $0 photo.jpg --file /var/www/smalldisplay/image-seeedframe.png"
   echo "  Tune saturation with an env var, e.g.: SATURATION=200 $0 photo.jpg 192.168.1.220"
+  echo "  Tune the pink/purple-showing-as-white fix: PINK_FIX=0.4 $0 ...   or   PINK_FIX=0 $0 ... to disable"
   echo "  Tune/disable contrast stretch: CONTRAST_STRETCH=2% $0 ...   or   NORMALIZE=0 $0 ..."
 }
 
@@ -96,6 +97,15 @@ CONTRAST_STRETCH="${CONTRAST_STRETCH:-1%}"
 # palette colors instead of the muddier in-between ones during dithering.
 SATURATION="${SATURATION:-160}"
 
+# This panel's "red" is a fairly dark, muted maroon, not a vivid red — so any
+# bright pink/magenta is numerically closer to white than to that dark red,
+# and gets dithered to white instead. PINK_FIX pulls brightness down, but only
+# on saturated/colorful pixels (weighted by how saturated each pixel already
+# is) — true whites and grays (saturation ≈ 0) are left untouched, unlike a
+# flat brightness cut which dims everything including real whites to gray.
+# 0 = off. Try 0.3-0.4 if pinks/purples are washing out to white on the panel.
+PINK_FIX="${PINK_FIX:-0.4}"
+
 # --- Spectra 6 palette (from the firmware's own calibration data) ---
 # perceived = how each color actually looks on the panel (used for dithering)
 # theoretical = the pure RGB value the device expects in the final pixels
@@ -116,8 +126,14 @@ else
   cp "$WORKDIR/cover.png" "$WORKDIR/normalized.png"
 fi
 
-echo "3/6  Boosting saturation (${SATURATION}%)..."
-convert "$WORKDIR/normalized.png" -modulate 100,"${SATURATION}",100 "$WORKDIR/saturated.png"
+echo "3/6  Boosting saturation (${SATURATION}%) and applying pink/purple fix (${PINK_FIX})..."
+if [ "$PINK_FIX" = "0" ]; then
+  convert "$WORKDIR/normalized.png" -modulate 100,"${SATURATION}",100 "$WORKDIR/saturated.png"
+else
+  convert "$WORKDIR/normalized.png" -modulate 100,"${SATURATION}",100 \
+    -colorspace HSB -channel B -fx "b - ${PINK_FIX}*g" +channel -colorspace sRGB \
+    "$WORKDIR/saturated.png"
+fi
 
 echo "4/6  Building device palette swatch..."
 convert "${PERCEIVED[@]/#/xc:}" +append "$WORKDIR/palette.png"
